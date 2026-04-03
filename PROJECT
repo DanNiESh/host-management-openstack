@@ -1,0 +1,17 @@
+domain: openshift.io
+layout:
+- go.kubebuilder.io/v4
+plugins:
+  manifests.sdk.operatorframework.io/v2: {}
+  scorecard.sdk.operatorframework.io/v2: {}
+projectName: host-management-openstack
+repo: github.com/osac-project/host-management-openstack
+resources:
+- controller: true
+  domain: openshift.io
+  external: true
+  group: osac
+  kind: HostLease
+  path: github.com/osac-project/bare-metal-operator/api/v1alpha1
+  version: v1alpha1
+version: "3"

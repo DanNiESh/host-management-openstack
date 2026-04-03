@@ -1,0 +1,16 @@
+apiVersion: osac.openshift.io/v1alpha1
+kind: HostLease
+metadata:
+  name: hostlease-sample
+  namespace: osac-namespace
+spec:
+  externalID: 519d6b37-13a9-444c-9a2a-bcac8a33dc44
+  externalName: MOC-R4PAC08U23-S3
+  hostType: fc830
+  hostClass: openstack
+  networkClass: openstack
+  networkInterfaces:
+    - macAddress: aa:bb:cc:dd:ee:f1
+      network: private-vlan-network
+  poweredOn: false
+  templateID: default_template

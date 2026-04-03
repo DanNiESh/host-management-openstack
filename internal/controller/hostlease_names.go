@@ -13,3 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+package controller
+
+import "time"
+
+const (
+	hostClass          = "openstack"
+	hostLeaseFinalizer = "osac.openshift.io/host-management"
+
+	// DefaultRecheckInterval is the default interval for polling Ironic power state.
+	DefaultRecheckInterval = 60 * time.Second
+)

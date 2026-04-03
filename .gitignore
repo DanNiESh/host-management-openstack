@@ -5,7 +5,10 @@
 *.so
 *.dylib
 bin/*
+main
 Dockerfile.cross
+Dockerfile.manifests
+dist/
 
 # Test binary, built with `go test -c`
 *.test
@@ -25,3 +28,9 @@ go.work
 *.swp
 *.swo
 *~
+
+# Development memory/notes (local only)
+MEMORY.md
+
+# Claude notes
+CLAUDE.md

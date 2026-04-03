@@ -36,6 +36,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	v1alpha1 "github.com/osac-project/bare-metal-operator/api/v1alpha1"
+	"github.com/osac-project/host-management-openstack/internal/controller"
+	"github.com/osac-project/host-management-openstack/internal/ironic"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -46,7 +50,7 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
+	utilruntime.Must(v1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -116,7 +120,7 @@ func main() {
 			filepath.Join(webhookCertPath, webhookCertKey),
 		)
 		if err != nil {
-			setupLog.Error(err, "Failed to initialize webhook certificate watcher")
+			setupLog.Error(err, "failed to initialize webhook certificate watcher")
 			os.Exit(1)
 		}
 
@@ -165,7 +169,7 @@ func main() {
 			filepath.Join(metricsCertPath, metricsCertKey),
 		)
 		if err != nil {
-			setupLog.Error(err, "to initialize metrics certificate watcher", "error", err)
+			setupLog.Error(err, "failed to initialize metrics certificate watcher", "error", err)
 			os.Exit(1)
 		}
 
@@ -198,6 +202,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Ironic client for bare metal management
+	var ironicClient *ironic.Client
+	if ironicClient, err = ironic.NewClient(); err != nil {
+		setupLog.Error(err, "failed to create Ironic client")
+		os.Exit(1)
+	}
+	setupLog.Info("Connect to ironic", "endpoint", ironicClient.GetEndpoint())
+
+	// Create HostLease reconciler with defaults
+	hostLeaseReconciler := controller.NewHostLeaseReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		ironicClient,
+		0, // Use DefaultRecheckInterval
+	)
+	if err := hostLeaseReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "OpenStack Host")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if metricsCertWatcher != nil {

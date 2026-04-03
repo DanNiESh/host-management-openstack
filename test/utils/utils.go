@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package utils provides testing utilities for the host-management-openstack project.
 package utils
 
 import (
