@@ -81,3 +81,30 @@ func (c *Client) SetPowerState(ctx context.Context, nodeID string, target Target
 	}
 	return nil
 }
+
+// UpdateNode applies a JSON Patch (RFC 6902) to the node.
+func (c *Client) UpdateNode(ctx context.Context, nodeID string, patch nodes.UpdateOpts) (*nodes.Node, error) {
+	updated, err := nodes.Update(ctx, c.serviceClient, nodeID, patch).Extract()
+	if err != nil {
+		return nil, fmt.Errorf("update node %s: %w", nodeID, err)
+	}
+	return updated, nil
+}
+
+// ValidateNode runs Ironic node validation.
+func (c *Client) ValidateNode(ctx context.Context, nodeID string) (*nodes.NodeValidation, error) {
+	v, err := nodes.Validate(ctx, c.serviceClient, nodeID).Extract()
+	if err != nil {
+		return nil, fmt.Errorf("validate node %s: %w", nodeID, err)
+	}
+	return v, nil
+}
+
+// ChangeProvisionState sets the node target provision state (e.g. active to deploy).
+func (c *Client) ChangeProvisionState(ctx context.Context, nodeID string, opts nodes.ProvisionStateOpts) error {
+	res := nodes.ChangeProvisionState(ctx, c.serviceClient, nodeID, opts)
+	if res.Err != nil {
+		return fmt.Errorf("change provision state for node %s: %w", nodeID, res.Err)
+	}
+	return nil
+}
