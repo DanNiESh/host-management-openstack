@@ -40,6 +40,7 @@ import (
 	v1alpha1 "github.com/osac-project/bare-metal-operator/api/v1alpha1"
 	"github.com/osac-project/host-management-openstack/internal/controller"
 	"github.com/osac-project/host-management-openstack/internal/ironic"
+	"github.com/osac-project/host-management-openstack/internal/neutron"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -208,13 +209,22 @@ func main() {
 		setupLog.Error(err, "failed to create Ironic client")
 		os.Exit(1)
 	}
-	setupLog.Info("Connect to ironic", "endpoint", ironicClient.GetEndpoint())
+	setupLog.Info("Connected to Ironic", "endpoint", ironicClient.GetEndpoint())
+
+	// Neutron client for network management
+	var neutronClient *neutron.Client
+	if neutronClient, err = neutron.NewClient(); err != nil {
+		setupLog.Error(err, "failed to create Neutron client")
+		os.Exit(1)
+	}
+	setupLog.Info("Connected to Neutron", "endpoint", neutronClient.GetEndpoint())
 
 	// Create HostLease reconciler with defaults
 	hostLeaseReconciler := controller.NewHostLeaseReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		ironicClient,
+		neutronClient,
 		0, // Use DefaultRecheckInterval
 	)
 	if err := hostLeaseReconciler.SetupWithManager(mgr); err != nil {

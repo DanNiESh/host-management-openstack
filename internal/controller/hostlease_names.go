@@ -20,6 +20,7 @@ import "time"
 
 const (
 	hostClass          = "openstack"
+	networkClass       = "openstack"
 	hostLeaseFinalizer = "osac.openshift.io/host-management"
 
 	// DefaultRecheckInterval is the default interval for polling Ironic power state.

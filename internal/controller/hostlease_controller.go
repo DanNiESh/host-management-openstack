@@ -19,10 +19,13 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/gophercloud/gophercloud/v2/openstack/baremetal/v1/nodes"
+	baremetalports "github.com/gophercloud/gophercloud/v2/openstack/baremetal/v1/ports"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -32,13 +35,15 @@ import (
 
 	v1alpha1 "github.com/osac-project/bare-metal-operator/api/v1alpha1"
 	"github.com/osac-project/host-management-openstack/internal/ironic"
+	"github.com/osac-project/host-management-openstack/internal/neutron"
 )
 
-// HostLeaseReconciler reconciles HostLease CRs for power management via Ironic.
+// HostLeaseReconciler reconciles HostLease CRs for power and network management via Ironic and Neutron.
 type HostLeaseReconciler struct {
 	client.Client
-	Scheme       *runtime.Scheme
-	IronicClient ironic.NodeClient
+	Scheme        *runtime.Scheme
+	IronicClient  ironic.NodeClient
+	NeutronClient neutron.NetworkClient
 
 	// RecheckInterval is the interval for polling Ironic until power state matches desired state.
 	RecheckInterval time.Duration
@@ -49,6 +54,7 @@ func NewHostLeaseReconciler(
 	client client.Client,
 	scheme *runtime.Scheme,
 	ironicClient ironic.NodeClient,
+	neutronClient neutron.NetworkClient,
 	recheckInterval time.Duration,
 ) *HostLeaseReconciler {
 	if recheckInterval <= 0 {
@@ -59,6 +65,7 @@ func NewHostLeaseReconciler(
 		Client:          client,
 		Scheme:          scheme,
 		IronicClient:    ironicClient,
+		NeutronClient:   neutronClient,
 		RecheckInterval: recheckInterval,
 	}
 }
@@ -126,41 +133,45 @@ func (r *HostLeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 	log.V(1).Info("Ironic node", "nodeID", hostLease.Spec.ExternalID, "power_state", node.PowerState)
 
-	// Return before power reconciliation and status sync.
-	if hostLease.Spec.PoweredOn == nil {
-		return ctrl.Result{}, nil
+	var powerErr error
+	if hostLease.Spec.PoweredOn != nil {
+		if err := r.reconcilePower(ctx, hostLease, node, log); err != nil {
+			powerErr = err
+			log.Error(err, "power reconciliation failed", "nodeID", hostLease.Spec.ExternalID)
+			r.syncHostLeaseStatus(hostLease, nil, err)
+		} else {
+			node, err = r.IronicClient.GetNode(ctx, hostLease.Spec.ExternalID)
+			if err != nil {
+				powerErr = err
+				log.Error(err, "failed to refresh node after power reconciliation", "nodeID", hostLease.Spec.ExternalID)
+				r.syncHostLeaseStatus(hostLease, nil, err)
+			} else {
+				r.syncHostLeaseStatus(hostLease, node, nil)
+			}
+		}
 	}
 
-	if err := r.reconcilePower(ctx, hostLease, node, log); err != nil {
-		r.syncHostLeaseStatus(hostLease, nil, err)
+	if err := r.reconcileNetwork(ctx, hostLease, log); err != nil {
+		log.Error(err, "network reconciliation failed", "nodeID", hostLease.Spec.ExternalID)
 		if statusErr := r.Status().Update(ctx, hostLease); statusErr != nil {
-			log.Error(statusErr, "failed to update HostLease status after power failure")
+			log.Error(statusErr, "failed to update HostLease status after network failure")
 		}
 		return ctrl.Result{}, err
 	}
 
-	node, err = r.IronicClient.GetNode(ctx, hostLease.Spec.ExternalID)
-	if err != nil {
-		log.Error(err, "failed to refresh node after power reconciliation", "nodeID", hostLease.Spec.ExternalID, "Error", err.Error())
-		r.syncHostLeaseStatus(hostLease, nil, err)
-		if statusErr := r.Status().Update(ctx, hostLease); statusErr != nil {
-			log.Error(statusErr, "failed to update HostLease status after node refresh failure")
-		}
-		return ctrl.Result{}, err
-	}
-
-	// Sync the HostLease status
-	r.syncHostLeaseStatus(hostLease, node, nil)
-
-	// Update the HostLease status
 	if err := r.Status().Update(ctx, hostLease); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Requeue to poll Ironic until power state matches desired; stop once synced.
-	currentlyOn := node.PowerState == ironic.PowerOn.String()
-	if *hostLease.Spec.PoweredOn != currentlyOn {
-		return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
+	if powerErr != nil {
+		return ctrl.Result{}, powerErr
+	}
+
+	if hostLease.Spec.PoweredOn != nil {
+		currentlyOn := node.PowerState == ironic.PowerOn.String()
+		if *hostLease.Spec.PoweredOn != currentlyOn {
+			return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
+		}
 	}
 
 	return ctrl.Result{}, nil
@@ -213,6 +224,121 @@ func (r *HostLeaseReconciler) reconcilePower(ctx context.Context, hostLease *v1a
 	}
 
 	return err
+}
+
+func (r *HostLeaseReconciler) reconcileNetwork(ctx context.Context, hostLease *v1alpha1.HostLease, log logr.Logger) error {
+	if hostLease.Spec.NetworkClass != networkClass {
+		log.V(1).Info("Skipping network reconciliation", "reason", "networkClass mismatch",
+			"want", networkClass, "got", hostLease.Spec.NetworkClass)
+		return nil
+	}
+
+	bmPorts, err := r.IronicClient.ListNodePorts(ctx, hostLease.Spec.ExternalID)
+	if err != nil {
+		return err
+	}
+
+	if len(hostLease.Spec.NetworkInterfaces) == 0 {
+		return r.detachAllVIFs(ctx, hostLease, bmPorts, log)
+	}
+
+	bmPortByMAC := make(map[string]baremetalports.Port, len(bmPorts))
+	for _, p := range bmPorts {
+		bmPortByMAC[strings.ToLower(p.Address)] = p
+	}
+	return r.attachNetworks(ctx, hostLease, bmPortByMAC, log)
+}
+
+func (r *HostLeaseReconciler) detachAllVIFs(ctx context.Context, hostLease *v1alpha1.HostLease, bmPorts []baremetalports.Port, log logr.Logger) error {
+	for _, p := range bmPorts {
+		vifID, ok := p.InternalInfo["tenant_vif_port_id"].(string)
+		if !ok || vifID == "" {
+			continue
+		}
+
+		log.Info("Detaching VIF", "nodeID", hostLease.Spec.ExternalID, "vifID", vifID)
+		if err := r.IronicClient.DetachVIF(ctx, hostLease.Spec.ExternalID, vifID); err != nil {
+			return err
+		}
+		if err := r.NeutronClient.DeletePort(ctx, vifID); err != nil {
+			return err
+		}
+	}
+
+	hostLease.Status.NetworkInterfaces = nil
+	return nil
+}
+
+func (r *HostLeaseReconciler) attachNetworks(ctx context.Context, hostLease *v1alpha1.HostLease, bmPortByMAC map[string]baremetalports.Port, log logr.Logger) error {
+	networks, err := r.NeutronClient.ListNetworks(ctx)
+	if err != nil {
+		return err
+	}
+
+	networkIDByName := make(map[string]string, len(networks))
+	for _, n := range networks {
+		networkIDByName[n.Name] = n.ID
+	}
+
+	statusInterfaces := make([]v1alpha1.NetworkInterfaceStatus, 0, len(hostLease.Spec.NetworkInterfaces))
+
+	for _, iface := range hostLease.Spec.NetworkInterfaces {
+		bmPort, found := bmPortByMAC[strings.ToLower(iface.MACAddress)]
+		if !found {
+			log.Info("No baremetal port found for MAC, skipping", "macAddress", iface.MACAddress)
+			continue
+		}
+
+		networkID, found := networkIDByName[iface.Network]
+		if !found {
+			return fmt.Errorf("network %q not found in Neutron", iface.Network)
+		}
+
+		currentVIF, _ := bmPort.InternalInfo["tenant_vif_port_id"].(string)
+
+		if currentVIF != "" {
+			onNetwork, err := r.NeutronClient.IsPortOnNetwork(ctx, currentVIF, networkID)
+			if err != nil {
+				return err
+			}
+			if onNetwork {
+				log.V(1).Info("VIF already attached to correct network", "macAddress", iface.MACAddress, "network", iface.Network)
+				statusInterfaces = append(statusInterfaces, v1alpha1.NetworkInterfaceStatus(iface))
+				continue
+			}
+
+			log.Info("Detaching VIF from wrong network", "vifID", currentVIF, "macAddress", iface.MACAddress)
+			if err := r.IronicClient.DetachVIF(ctx, hostLease.Spec.ExternalID, currentVIF); err != nil {
+				return err
+			}
+			if err := r.NeutronClient.DeletePort(ctx, currentVIF); err != nil {
+				return err
+			}
+		}
+
+		portName := hostLease.Name + "-" + strings.ReplaceAll(iface.MACAddress, ":", "")
+		port, err := r.NeutronClient.FindPort(ctx, portName)
+		if err != nil {
+			return err
+		}
+		if port == nil {
+			log.Info("Creating Neutron port", "name", portName, "networkID", networkID)
+			port, err = r.NeutronClient.CreatePort(ctx, portName, networkID, "baremetal:none")
+			if err != nil {
+				return err
+			}
+		}
+
+		log.Info("Attaching VIF", "vifID", port.ID, "baremetalPort", bmPort.UUID, "macAddress", iface.MACAddress)
+		if err := r.IronicClient.AttachVIF(ctx, hostLease.Spec.ExternalID, port.ID, bmPort.UUID); err != nil {
+			return err
+		}
+
+		statusInterfaces = append(statusInterfaces, v1alpha1.NetworkInterfaceStatus(iface))
+	}
+
+	hostLease.Status.NetworkInterfaces = statusInterfaces
+	return nil
 }
 
 // syncHostLeaseStatus syncs the phase, conditions, and power state.

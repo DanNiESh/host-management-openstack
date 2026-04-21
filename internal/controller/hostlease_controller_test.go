@@ -25,6 +25,9 @@ import (
 	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
 
 	"github.com/gophercloud/gophercloud/v2/openstack/baremetal/v1/nodes"
+	baremetalports "github.com/gophercloud/gophercloud/v2/openstack/baremetal/v1/ports"
+	neutronnetworks "github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
+	neutronports "github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -45,6 +48,9 @@ type mockIronicClient struct {
 	getNodeFunc                  func(ctx context.Context, nodeID string) (*nodes.Node, error)
 	setPowerStateFunc            func(ctx context.Context, nodeID string, target ironic.TargetPowerState) error
 	isNodePowerTransitioningFunc func(node *nodes.Node) bool
+	listNodePortsFunc            func(ctx context.Context, nodeID string) ([]baremetalports.Port, error)
+	attachVIFFunc                func(ctx context.Context, nodeID, vifID, baremetalPortID string) error
+	detachVIFFunc                func(ctx context.Context, nodeID, vifID string) error
 }
 
 func (m *mockIronicClient) GetNode(ctx context.Context, nodeID string) (*nodes.Node, error) {
@@ -68,16 +74,82 @@ func (m *mockIronicClient) IsNodePowerTransitioning(node *nodes.Node) bool {
 	return node.TargetPowerState != ""
 }
 
+func (m *mockIronicClient) ListNodePorts(ctx context.Context, nodeID string) ([]baremetalports.Port, error) {
+	if m.listNodePortsFunc != nil {
+		return m.listNodePortsFunc(ctx, nodeID)
+	}
+	return nil, nil
+}
+
+func (m *mockIronicClient) AttachVIF(ctx context.Context, nodeID, vifID, baremetalPortID string) error {
+	if m.attachVIFFunc != nil {
+		return m.attachVIFFunc(ctx, nodeID, vifID, baremetalPortID)
+	}
+	return nil
+}
+
+func (m *mockIronicClient) DetachVIF(ctx context.Context, nodeID, vifID string) error {
+	if m.detachVIFFunc != nil {
+		return m.detachVIFFunc(ctx, nodeID, vifID)
+	}
+	return nil
+}
+
+// mockNeutronClient implements neutron.NetworkClient for testing.
+type mockNeutronClient struct {
+	listNetworksFunc    func(ctx context.Context) ([]neutronnetworks.Network, error)
+	findPortFunc        func(ctx context.Context, portName string) (*neutronports.Port, error)
+	createPortFunc      func(ctx context.Context, name, networkID, deviceOwner string) (*neutronports.Port, error)
+	deletePortFunc      func(ctx context.Context, portID string) error
+	isPortOnNetworkFunc func(ctx context.Context, portID, networkID string) (bool, error)
+}
+
+func (m *mockNeutronClient) ListNetworks(ctx context.Context) ([]neutronnetworks.Network, error) {
+	if m.listNetworksFunc != nil {
+		return m.listNetworksFunc(ctx)
+	}
+	return nil, nil
+}
+
+func (m *mockNeutronClient) FindPort(ctx context.Context, portName string) (*neutronports.Port, error) {
+	if m.findPortFunc != nil {
+		return m.findPortFunc(ctx, portName)
+	}
+	return nil, nil
+}
+
+func (m *mockNeutronClient) CreatePort(ctx context.Context, name, networkID, deviceOwner string) (*neutronports.Port, error) {
+	if m.createPortFunc != nil {
+		return m.createPortFunc(ctx, name, networkID, deviceOwner)
+	}
+	return &neutronports.Port{ID: "new-port-id"}, nil
+}
+
+func (m *mockNeutronClient) DeletePort(ctx context.Context, portID string) error {
+	if m.deletePortFunc != nil {
+		return m.deletePortFunc(ctx, portID)
+	}
+	return nil
+}
+
+func (m *mockNeutronClient) IsPortOnNetwork(ctx context.Context, portID, networkID string) (bool, error) {
+	if m.isPortOnNetworkFunc != nil {
+		return m.isPortOnNetworkFunc(ctx, portID, networkID)
+	}
+	return false, nil
+}
+
 func boolPtr(b bool) *bool {
 	return &b
 }
 
 var _ = Describe("HostLeaseReconciler", func() {
 	var (
-		reconciler *HostLeaseReconciler
-		mockIronic *mockIronicClient
-		testScheme *runtime.Scheme
-		log        = zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true))
+		reconciler  *HostLeaseReconciler
+		mockIronic  *mockIronicClient
+		mockNeutron *mockNeutronClient
+		testScheme  *runtime.Scheme
+		log         = zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true))
 	)
 
 	BeforeEach(func() {
@@ -86,21 +158,23 @@ var _ = Describe("HostLeaseReconciler", func() {
 		Expect(v1alpha1.AddToScheme(testScheme)).To(Succeed())
 
 		mockIronic = &mockIronicClient{}
+		mockNeutron = &mockNeutronClient{}
 		reconciler = &HostLeaseReconciler{
 			Scheme:          testScheme,
 			IronicClient:    mockIronic,
+			NeutronClient:   mockNeutron,
 			RecheckInterval: 10 * time.Second,
 		}
 	})
 
 	Describe("NewHostLeaseReconciler", func() {
 		It("should use the provided recheck interval when positive", func() {
-			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, 30*time.Second)
+			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, mockNeutron, 30*time.Second)
 			Expect(r.RecheckInterval).To(Equal(30 * time.Second))
 		})
 
 		It("should use the default recheck interval when zero", func() {
-			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, 0)
+			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, mockNeutron, 0)
 			Expect(r.RecheckInterval).To(Equal(DefaultRecheckInterval))
 		})
 	})
@@ -593,6 +667,79 @@ var _ = Describe("HostLeaseReconciler", func() {
 			}, updatedHostLease)).To(Succeed())
 			Expect(updatedHostLease.Status.Phase).To(Equal(v1alpha1.HostLeasePhaseProgressing))
 		})
+
+		It("should run network reconciliation even when power reconciliation fails", func() {
+			hostLease := &v1alpha1.HostLease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "hostlease-power-fail-net-ok",
+					Namespace: "default",
+					Finalizers: []string{
+						hostLeaseFinalizer,
+					},
+				},
+				Spec: v1alpha1.HostLeaseSpec{
+					ExternalID:   "node-power-fail",
+					HostClass:    hostClass,
+					NetworkClass: "openstack",
+					PoweredOn:    boolPtr(true),
+					NetworkInterfaces: []v1alpha1.NetworkInterfaceSpec{
+						{MACAddress: "aa:bb:cc:dd:ee:f1", Network: "test-net"},
+					},
+				},
+			}
+			reconciler.Client = fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithStatusSubresource(hostLease).
+				WithObjects(hostLease).
+				Build()
+
+			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
+				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			}
+			mockIronic.setPowerStateFunc = func(_ context.Context, _ string, _ ironic.TargetPowerState) error {
+				return errors.New("ironic power failure")
+			}
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				return []baremetalports.Port{
+					{UUID: "bm-port-1", Address: "aa:bb:cc:dd:ee:f1"},
+				}, nil
+			}
+			mockNeutron.listNetworksFunc = func(_ context.Context) ([]neutronnetworks.Network, error) {
+				return []neutronnetworks.Network{
+					{ID: "net-id-1", Name: "test-net"},
+				}, nil
+			}
+			mockNeutron.findPortFunc = func(_ context.Context, _ string) (*neutronports.Port, error) {
+				return nil, nil
+			}
+			mockNeutron.createPortFunc = func(_ context.Context, _, networkID, _ string) (*neutronports.Port, error) {
+				return &neutronports.Port{ID: "new-port", NetworkID: networkID}, nil
+			}
+
+			networkAttached := false
+			mockIronic.attachVIFFunc = func(_ context.Context, _, _, _ string) error {
+				networkAttached = true
+				return nil
+			}
+
+			_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      hostLease.Name,
+					Namespace: hostLease.Namespace,
+				},
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("ironic power failure"))
+			Expect(networkAttached).To(BeTrue())
+
+			updatedHostLease := &v1alpha1.HostLease{}
+			Expect(reconciler.Get(context.Background(), types.NamespacedName{
+				Name:      hostLease.Name,
+				Namespace: hostLease.Namespace,
+			}, updatedHostLease)).To(Succeed())
+			Expect(updatedHostLease.Status.NetworkInterfaces).To(HaveLen(1))
+			Expect(updatedHostLease.Status.NetworkInterfaces[0].Network).To(Equal("test-net"))
+		})
 	})
 
 	Describe("syncHostLeaseStatus", func() {
@@ -661,6 +808,335 @@ var _ = Describe("HostLeaseReconciler", func() {
 
 			Expect(hostLease.Status.PoweredOn).To(BeNil())
 			Expect(hostLease.Status.Conditions).To(BeEmpty())
+		})
+	})
+
+	Describe("reconcileNetwork", func() {
+		var (
+			ctx       context.Context
+			hostLease *v1alpha1.HostLease
+		)
+
+		BeforeEach(func() {
+			ctx = context.Background()
+			hostLease = &v1alpha1.HostLease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "hostlease-network",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.HostLeaseSpec{
+					ExternalID:   "node-net-1",
+					HostClass:    hostClass,
+					NetworkClass: "openstack",
+				},
+			}
+		})
+
+		It("should skip when networkClass is not openstack", func() {
+			hostLease.Spec.NetworkClass = "other"
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).NotTo(HaveOccurred())
+
+			listCalled := false
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				listCalled = true
+				return nil, nil
+			}
+			Expect(listCalled).To(BeFalse())
+		})
+
+		It("should skip when networkClass is empty", func() {
+			hostLease.Spec.NetworkClass = ""
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should skip when networkInterfaces is empty and no VIFs attached", func() {
+			hostLease.Spec.NetworkInterfaces = nil
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				return []baremetalports.Port{
+					{UUID: "bm-port-1", Address: "aa:bb:cc:dd:ee:f1"},
+				}, nil
+			}
+
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hostLease.Status.NetworkInterfaces).To(BeEmpty())
+		})
+
+		It("should detach VIF and delete port when networkInterfaces is empty and VIF is attached", func() {
+			hostLease.Spec.NetworkInterfaces = nil
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				return []baremetalports.Port{
+					{
+						UUID:    "bm-port-1",
+						Address: "aa:bb:cc:dd:ee:f1",
+						InternalInfo: map[string]any{
+							"tenant_vif_port_id": "neutron-port-1",
+						},
+					},
+				}, nil
+			}
+
+			var detachedVIF string
+			mockIronic.detachVIFFunc = func(_ context.Context, nodeID, vifID string) error {
+				detachedVIF = vifID
+				return nil
+			}
+
+			var deletedPort string
+			mockNeutron.deletePortFunc = func(_ context.Context, portID string) error {
+				deletedPort = portID
+				return nil
+			}
+
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(detachedVIF).To(Equal("neutron-port-1"))
+			Expect(deletedPort).To(Equal("neutron-port-1"))
+			Expect(hostLease.Status.NetworkInterfaces).To(BeEmpty())
+		})
+
+		It("should attach VIF when networkInterfaces specifies a network", func() {
+			hostLease.Spec.NetworkInterfaces = []v1alpha1.NetworkInterfaceSpec{
+				{MACAddress: "aa:bb:cc:dd:ee:f1", Network: "private-net"},
+			}
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				return []baremetalports.Port{
+					{UUID: "bm-port-1", Address: "aa:bb:cc:dd:ee:f1"},
+				}, nil
+			}
+			mockNeutron.listNetworksFunc = func(_ context.Context) ([]neutronnetworks.Network, error) {
+				return []neutronnetworks.Network{
+					{ID: "net-id-1", Name: "private-net"},
+				}, nil
+			}
+			mockNeutron.findPortFunc = func(_ context.Context, _ string) (*neutronports.Port, error) {
+				return nil, nil
+			}
+			mockNeutron.createPortFunc = func(_ context.Context, name, networkID, _ string) (*neutronports.Port, error) {
+				Expect(networkID).To(Equal("net-id-1"))
+				return &neutronports.Port{ID: "new-neutron-port", NetworkID: "net-id-1"}, nil
+			}
+
+			var attachedVIF, attachedBMPort string
+			mockIronic.attachVIFFunc = func(_ context.Context, _, vifID, bmPortID string) error {
+				attachedVIF = vifID
+				attachedBMPort = bmPortID
+				return nil
+			}
+
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(attachedVIF).To(Equal("new-neutron-port"))
+			Expect(attachedBMPort).To(Equal("bm-port-1"))
+			Expect(hostLease.Status.NetworkInterfaces).To(HaveLen(1))
+			Expect(hostLease.Status.NetworkInterfaces[0].MACAddress).To(Equal("aa:bb:cc:dd:ee:f1"))
+			Expect(hostLease.Status.NetworkInterfaces[0].Network).To(Equal("private-net"))
+		})
+
+		It("should reuse existing neutron port if found", func() {
+			hostLease.Spec.NetworkInterfaces = []v1alpha1.NetworkInterfaceSpec{
+				{MACAddress: "aa:bb:cc:dd:ee:f1", Network: "private-net"},
+			}
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				return []baremetalports.Port{
+					{UUID: "bm-port-1", Address: "aa:bb:cc:dd:ee:f1"},
+				}, nil
+			}
+			mockNeutron.listNetworksFunc = func(_ context.Context) ([]neutronnetworks.Network, error) {
+				return []neutronnetworks.Network{
+					{ID: "net-id-1", Name: "private-net"},
+				}, nil
+			}
+			mockNeutron.findPortFunc = func(_ context.Context, _ string) (*neutronports.Port, error) {
+				return &neutronports.Port{ID: "existing-port", NetworkID: "net-id-1"}, nil
+			}
+
+			createCalled := false
+			mockNeutron.createPortFunc = func(_ context.Context, _, _, _ string) (*neutronports.Port, error) {
+				createCalled = true
+				return nil, nil
+			}
+
+			var attachedVIF string
+			mockIronic.attachVIFFunc = func(_ context.Context, _, vifID, _ string) error {
+				attachedVIF = vifID
+				return nil
+			}
+
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(createCalled).To(BeFalse())
+			Expect(attachedVIF).To(Equal("existing-port"))
+		})
+
+		It("should skip interface when no matching baremetal port found", func() {
+			hostLease.Spec.NetworkInterfaces = []v1alpha1.NetworkInterfaceSpec{
+				{MACAddress: "aa:bb:cc:dd:ee:ff", Network: "private-net"},
+			}
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				return []baremetalports.Port{
+					{UUID: "bm-port-1", Address: "aa:bb:cc:dd:ee:f1"},
+				}, nil
+			}
+
+			attachCalled := false
+			mockIronic.attachVIFFunc = func(_ context.Context, _, _, _ string) error {
+				attachCalled = true
+				return nil
+			}
+
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(attachCalled).To(BeFalse())
+			Expect(hostLease.Status.NetworkInterfaces).To(BeEmpty())
+		})
+
+		It("should no-op when VIF is already attached to correct network", func() {
+			hostLease.Spec.NetworkInterfaces = []v1alpha1.NetworkInterfaceSpec{
+				{MACAddress: "aa:bb:cc:dd:ee:f1", Network: "private-net"},
+			}
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				return []baremetalports.Port{
+					{
+						UUID:    "bm-port-1",
+						Address: "aa:bb:cc:dd:ee:f1",
+						InternalInfo: map[string]any{
+							"tenant_vif_port_id": "existing-neutron-port",
+						},
+					},
+				}, nil
+			}
+			mockNeutron.listNetworksFunc = func(_ context.Context) ([]neutronnetworks.Network, error) {
+				return []neutronnetworks.Network{
+					{ID: "net-id-1", Name: "private-net"},
+				}, nil
+			}
+			mockNeutron.isPortOnNetworkFunc = func(_ context.Context, portID, networkID string) (bool, error) {
+				Expect(portID).To(Equal("existing-neutron-port"))
+				Expect(networkID).To(Equal("net-id-1"))
+				return true, nil
+			}
+
+			attachCalled := false
+			mockIronic.attachVIFFunc = func(_ context.Context, _, _, _ string) error {
+				attachCalled = true
+				return nil
+			}
+
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(attachCalled).To(BeFalse())
+			Expect(hostLease.Status.NetworkInterfaces).To(HaveLen(1))
+			Expect(hostLease.Status.NetworkInterfaces[0].Network).To(Equal("private-net"))
+		})
+
+		It("should switch network when VIF is attached to wrong network", func() {
+			hostLease.Spec.NetworkInterfaces = []v1alpha1.NetworkInterfaceSpec{
+				{MACAddress: "aa:bb:cc:dd:ee:f1", Network: "new-net"},
+			}
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				return []baremetalports.Port{
+					{
+						UUID:    "bm-port-1",
+						Address: "aa:bb:cc:dd:ee:f1",
+						InternalInfo: map[string]any{
+							"tenant_vif_port_id": "old-neutron-port",
+						},
+					},
+				}, nil
+			}
+			mockNeutron.listNetworksFunc = func(_ context.Context) ([]neutronnetworks.Network, error) {
+				return []neutronnetworks.Network{
+					{ID: "old-net-id", Name: "old-net"},
+					{ID: "new-net-id", Name: "new-net"},
+				}, nil
+			}
+			mockNeutron.isPortOnNetworkFunc = func(_ context.Context, _, _ string) (bool, error) {
+				return false, nil
+			}
+			mockNeutron.findPortFunc = func(_ context.Context, _ string) (*neutronports.Port, error) {
+				return nil, nil
+			}
+
+			var detachedVIF, deletedPort string
+			mockIronic.detachVIFFunc = func(_ context.Context, _, vifID string) error {
+				detachedVIF = vifID
+				return nil
+			}
+			mockNeutron.deletePortFunc = func(_ context.Context, portID string) error {
+				deletedPort = portID
+				return nil
+			}
+			mockNeutron.createPortFunc = func(_ context.Context, _, networkID, _ string) (*neutronports.Port, error) {
+				return &neutronports.Port{ID: "new-neutron-port", NetworkID: networkID}, nil
+			}
+
+			var attachedVIF string
+			mockIronic.attachVIFFunc = func(_ context.Context, _, vifID, _ string) error {
+				attachedVIF = vifID
+				return nil
+			}
+
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(detachedVIF).To(Equal("old-neutron-port"))
+			Expect(deletedPort).To(Equal("old-neutron-port"))
+			Expect(attachedVIF).To(Equal("new-neutron-port"))
+			Expect(hostLease.Status.NetworkInterfaces).To(HaveLen(1))
+			Expect(hostLease.Status.NetworkInterfaces[0].Network).To(Equal("new-net"))
+		})
+
+		It("should return error when network not found", func() {
+			hostLease.Spec.NetworkInterfaces = []v1alpha1.NetworkInterfaceSpec{
+				{MACAddress: "aa:bb:cc:dd:ee:f1", Network: "nonexistent-net"},
+			}
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				return []baremetalports.Port{
+					{UUID: "bm-port-1", Address: "aa:bb:cc:dd:ee:f1"},
+				}, nil
+			}
+			mockNeutron.listNetworksFunc = func(_ context.Context) ([]neutronnetworks.Network, error) {
+				return []neutronnetworks.Network{
+					{ID: "net-id-1", Name: "other-net"},
+				}, nil
+			}
+
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("nonexistent-net"))
+		})
+
+		It("should return error when ListNodePorts fails", func() {
+			hostLease.Spec.NetworkInterfaces = []v1alpha1.NetworkInterfaceSpec{
+				{MACAddress: "aa:bb:cc:dd:ee:f1", Network: "private-net"},
+			}
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				return nil, errors.New("ironic list ports failed")
+			}
+
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("ironic list ports failed"))
+		})
+
+		It("should return error when ListNetworks fails", func() {
+			hostLease.Spec.NetworkInterfaces = []v1alpha1.NetworkInterfaceSpec{
+				{MACAddress: "aa:bb:cc:dd:ee:f1", Network: "private-net"},
+			}
+			mockIronic.listNodePortsFunc = func(_ context.Context, _ string) ([]baremetalports.Port, error) {
+				return []baremetalports.Port{
+					{UUID: "bm-port-1", Address: "aa:bb:cc:dd:ee:f1"},
+				}, nil
+			}
+			mockNeutron.listNetworksFunc = func(_ context.Context) ([]neutronnetworks.Network, error) {
+				return nil, errors.New("neutron API error")
+			}
+
+			err := reconciler.reconcileNetwork(ctx, hostLease, log)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("neutron API error"))
 		})
 	})
 })
