@@ -38,6 +38,8 @@ import (
 
 	v1alpha1 "github.com/osac-project/bare-metal-operator/api/v1alpha1"
 	"github.com/osac-project/host-management-openstack/internal/ironic"
+	opv1alpha1 "github.com/osac-project/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac-operator/pkg/provisioning"
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -104,13 +106,19 @@ var _ = Describe("HostLeaseReconciler", func() {
 
 	Describe("NewHostLeaseReconciler", func() {
 		It("should use the provided recheck interval when positive", func() {
-			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, "test-ns", 30*time.Second)
+			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, "test-ns", nil, 30*time.Second)
 			Expect(r.RecheckInterval).To(Equal(30 * time.Second))
 		})
 
 		It("should use the default recheck interval when zero", func() {
-			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, "test-ns", 0)
+			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, "test-ns", nil, 0)
 			Expect(r.RecheckInterval).To(Equal(DefaultRecheckInterval))
+		})
+
+		It("should store the provisioning provider", func() {
+			mockProvider := &provisioning.AAPProvider{}
+			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, "test-ns", mockProvider, 0)
+			Expect(r.ProvisioningProvider).To(Equal(mockProvider))
 		})
 	})
 
@@ -676,6 +684,155 @@ var _ = Describe("HostLeaseReconciler", func() {
 
 			e := event.UpdateEvent{ObjectOld: oldObj, ObjectNew: newObj}
 			Expect(p.Update(e)).To(BeFalse())
+		})
+	})
+
+	Describe("reconcileProvisioning", func() {
+		It("should skip provisioning when ProvisioningProvider is nil", func() {
+			hostLease := &v1alpha1.HostLease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "hostlease-no-aap",
+					Namespace:  "default",
+					Finalizers: []string{hostLeaseFinalizer},
+				},
+				Spec: v1alpha1.HostLeaseSpec{
+					ExternalHostID: "node-1",
+					HostClass:      hostClass,
+					TemplateID:     "image-provision",
+				},
+			}
+			reconciler.Client = fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithStatusSubresource(hostLease).
+				WithObjects(hostLease).
+				Build()
+			reconciler.ProvisioningProvider = nil
+
+			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
+				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      hostLease.Name,
+					Namespace: hostLease.Namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("should skip provisioning when templateID is noop", func() {
+			hostLease := &v1alpha1.HostLease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "hostlease-noop",
+					Namespace:  "default",
+					Finalizers: []string{hostLeaseFinalizer},
+				},
+				Spec: v1alpha1.HostLeaseSpec{
+					ExternalHostID: "node-1",
+					HostClass:      hostClass,
+					TemplateID:     "noop",
+				},
+			}
+			reconciler.ProvisioningProvider = &provisioning.AAPProvider{}
+			reconciler.Client = fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithStatusSubresource(hostLease).
+				WithObjects(hostLease).
+				Build()
+
+			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
+				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      hostLease.Name,
+					Namespace: hostLease.Namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("should skip provisioning when templateID is empty", func() {
+			hostLease := &v1alpha1.HostLease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "hostlease-empty-template",
+					Namespace:  "default",
+					Finalizers: []string{hostLeaseFinalizer},
+				},
+				Spec: v1alpha1.HostLeaseSpec{
+					ExternalHostID: "node-1",
+					HostClass:      hostClass,
+					TemplateID:     "",
+				},
+			}
+			reconciler.ProvisioningProvider = &provisioning.AAPProvider{}
+			reconciler.Client = fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithStatusSubresource(hostLease).
+				WithObjects(hostLease).
+				Build()
+
+			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
+				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      hostLease.Name,
+					Namespace: hostLease.Namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("should not re-trigger when a successful provision job exists", func() {
+			hostLease := &v1alpha1.HostLease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "hostlease-already-provisioned",
+					Namespace:  "default",
+					Finalizers: []string{hostLeaseFinalizer},
+				},
+				Spec: v1alpha1.HostLeaseSpec{
+					ExternalHostID: "node-1",
+					HostClass:      hostClass,
+					TemplateID:     "image-provision",
+				},
+				Status: v1alpha1.HostLeaseStatus{
+					Jobs: []opv1alpha1.JobStatus{
+						{
+							JobID:     "123",
+							Type:      opv1alpha1.JobTypeProvision,
+							State:     opv1alpha1.JobStateSucceeded,
+							Message:   "successful",
+							Timestamp: metav1.Now(),
+						},
+					},
+				},
+			}
+			reconciler.ProvisioningProvider = &provisioning.AAPProvider{}
+			reconciler.Client = fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithStatusSubresource(hostLease).
+				WithObjects(hostLease).
+				Build()
+
+			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
+				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      hostLease.Name,
+					Namespace: hostLease.Namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
 		})
 	})
 

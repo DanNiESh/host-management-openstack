@@ -21,6 +21,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -40,6 +41,8 @@ import (
 	v1alpha1 "github.com/osac-project/bare-metal-operator/api/v1alpha1"
 	"github.com/osac-project/host-management-openstack/internal/controller"
 	"github.com/osac-project/host-management-openstack/internal/ironic"
+	"github.com/osac-project/osac-operator/pkg/aap"
+	"github.com/osac-project/osac-operator/pkg/provisioning"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -210,12 +213,38 @@ func main() {
 	}
 	setupLog.Info("Connect to ironic", "endpoint", ironicClient.GetEndpoint())
 
+	// AAP provisioning provider for image provisioning workflows
+	var provisioningProvider provisioning.ProvisioningProvider
+	if aapURL := os.Getenv(controller.EnvAAPURL); aapURL != "" {
+		aapToken := os.Getenv(controller.EnvAAPToken)
+		insecureSkipVerify, _ := strconv.ParseBool(os.Getenv(controller.EnvAAPInsecureSkipVerify))
+		templatePrefix := os.Getenv(controller.EnvAAPTemplatePrefix)
+		if templatePrefix == "" {
+			templatePrefix = "osac"
+		}
+		aapClient := aap.NewClient(aapURL, aapToken, insecureSkipVerify)
+		var err error
+		provisioningProvider, err = provisioning.NewProvider(provisioning.ProviderConfig{
+			ProviderType:   provisioning.ProviderTypeAAP,
+			AAPClient:      aapClient,
+			TemplatePrefix: templatePrefix,
+		})
+		if err != nil {
+			setupLog.Error(err, "failed to create provisioning provider")
+			os.Exit(1)
+		}
+		setupLog.Info("AAP provisioning provider configured", "url", aapURL, "templatePrefix", templatePrefix)
+	} else {
+		setupLog.Info("AAP not configured, provisioning workflows disabled", "envVar", controller.EnvAAPURL)
+	}
+
 	// Create HostLease reconciler with defaults
 	hostLeaseReconciler := controller.NewHostLeaseReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		ironicClient,
 		os.Getenv(controller.EnvHostLeaseNamespace),
+		provisioningProvider,
 		0, // Use DefaultRecheckInterval
 	)
 	if err := hostLeaseReconciler.SetupWithManager(mgr); err != nil {

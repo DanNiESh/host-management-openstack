@@ -2,15 +2,15 @@ apiVersion: osac.openshift.io/v1alpha1
 kind: HostLease
 metadata:
   name: hostlease-1
-  namespace: osac-namespace
+  namespace: danniesh
 spec:
-  externalHostID: efa3d310-164d-44a4-a399-46cbcdaa587a
-  externalHostName: MOC-R4PAC08U21-S1
+  externalHostID: 758ddf40-69a9-460b-86b2-2ea876d33d5b
+  externalHostName: MOC-R4PAC08U33-S1A
   hostType: fc830
-  # hostClass: openstack
+  hostClass: openstack
   networkClass: openstack
   networkInterfaces:
     - macAddress: aa:bb:cc:dd:ee:f1
       network: private-vlan-network
   # poweredOn: on
-  templateID: default_template
+  templateID: osac.templates.bm_host_image_provision

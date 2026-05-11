@@ -28,4 +28,12 @@ const (
 
 	// DefaultRecheckInterval is the default interval for polling Ironic power state.
 	DefaultRecheckInterval = 60 * time.Second
+
+	// DefaultProvisionPollInterval is the default interval for polling AAP job status.
+	DefaultProvisionPollInterval = 30 * time.Second
+
+	EnvAAPURL                = "OSAC_AAP_URL"
+	EnvAAPToken              = "OSAC_AAP_TOKEN"
+	EnvAAPInsecureSkipVerify = "OSAC_AAP_INSECURE_SKIP_VERIFY"
+	EnvAAPTemplatePrefix     = "OSAC_AAP_TEMPLATE_PREFIX"
 )

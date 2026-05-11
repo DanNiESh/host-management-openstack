@@ -20,6 +20,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -36,19 +37,25 @@ import (
 
 	v1alpha1 "github.com/osac-project/bare-metal-operator/api/v1alpha1"
 	"github.com/osac-project/host-management-openstack/internal/ironic"
+	opv1alpha1 "github.com/osac-project/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac-operator/pkg/provisioning"
 )
 
 // HostLeaseReconciler reconciles HostLease CRs for power management via Ironic.
 type HostLeaseReconciler struct {
 	client.Client
-	Scheme       *runtime.Scheme
-	IronicClient ironic.NodeClient
+	Scheme               *runtime.Scheme
+	IronicClient         ironic.NodeClient
+	ProvisioningProvider provisioning.ProvisioningProvider
 
 	// Namespace restricts the controller to only reconcile HostLeases in this namespace.
 	Namespace string
 
 	// RecheckInterval is the interval for polling Ironic until power state matches desired state.
 	RecheckInterval time.Duration
+
+	// ProvisionPollInterval is the interval for polling AAP job status.
+	ProvisionPollInterval time.Duration
 }
 
 // NewHostLeaseReconciler creates a new HostLeaseReconciler with defaults applied.
@@ -57,6 +64,7 @@ func NewHostLeaseReconciler(
 	scheme *runtime.Scheme,
 	ironicClient ironic.NodeClient,
 	namespace string,
+	provider provisioning.ProvisioningProvider,
 	recheckInterval time.Duration,
 ) *HostLeaseReconciler {
 	if namespace == "" {
@@ -67,11 +75,13 @@ func NewHostLeaseReconciler(
 	}
 
 	return &HostLeaseReconciler{
-		Client:          client,
-		Scheme:          scheme,
-		IronicClient:    ironicClient,
-		Namespace:       namespace,
-		RecheckInterval: recheckInterval,
+		Client:                client,
+		Scheme:                scheme,
+		IronicClient:          ironicClient,
+		Namespace:             namespace,
+		ProvisioningProvider:  provider,
+		RecheckInterval:       recheckInterval,
+		ProvisionPollInterval: DefaultProvisionPollInterval,
 	}
 }
 
@@ -143,6 +153,10 @@ func (r *HostLeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if *hostLease.Spec.PoweredOn != currentlyOn {
 			return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
 		}
+	}
+
+	if r.ProvisioningProvider != nil && hostLease.Spec.TemplateID != "" && hostLease.Spec.TemplateID != "noop" {
+		return r.reconcileProvisioning(ctx, hostLease, log)
 	}
 
 	return ctrl.Result{}, nil
@@ -225,6 +239,115 @@ func (r *HostLeaseReconciler) reconcilePower(ctx context.Context, hostLease *v1a
 	}
 
 	return err
+}
+
+func (r *HostLeaseReconciler) reconcileProvisioning(ctx context.Context, hostLease *v1alpha1.HostLease, log logr.Logger) (ctrl.Result, error) {
+	latestJob := provisioning.FindLatestJobByType(hostLease.Status.Jobs, opv1alpha1.JobTypeProvision)
+
+	if latestJob != nil && latestJob.JobID != "" {
+		if latestJob.State.IsTerminal() {
+			if latestJob.State.IsSuccessful() {
+				return ctrl.Result{}, nil
+			}
+			log.Info("Previous provision job failed, retrying", "jobID", latestJob.JobID)
+		} else {
+			return r.pollProvisionJob(ctx, hostLease, latestJob, log)
+		}
+	}
+
+	return r.triggerProvisionJob(ctx, hostLease, log)
+}
+
+func (r *HostLeaseReconciler) triggerProvisionJob(ctx context.Context, hostLease *v1alpha1.HostLease, log logr.Logger) (ctrl.Result, error) {
+	result, err := r.ProvisioningProvider.TriggerProvision(ctx, hostLease)
+	if err != nil {
+		log.Error(err, "Failed to trigger provision job")
+		hostLease.SetStatusCondition(
+			v1alpha1.HostConditionProvisionTemplateComplete,
+			metav1.ConditionFalse,
+			v1alpha1.HostConditionReasonTemplateFailed,
+			fmt.Sprintf("Failed to trigger provision: %v", err),
+		)
+		if statusErr := r.Status().Update(ctx, hostLease); statusErr != nil {
+			log.Error(statusErr, "Failed to update status after trigger failure")
+		}
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Provision job triggered", "jobID", result.JobID, "templateID", hostLease.Spec.TemplateID)
+
+	hostLease.Status.Jobs = provisioning.AppendJob(hostLease.Status.Jobs, opv1alpha1.JobStatus{
+		JobID:     result.JobID,
+		Type:      opv1alpha1.JobTypeProvision,
+		State:     result.InitialState,
+		Message:   result.Message,
+		Timestamp: metav1.NewTime(time.Now().UTC()),
+	}, provisioning.DefaultMaxJobHistory)
+
+	hostLease.Status.Phase = v1alpha1.HostLeasePhaseProgressing
+	hostLease.SetStatusCondition(
+		v1alpha1.HostConditionProvisionTemplateComplete,
+		metav1.ConditionFalse,
+		v1alpha1.HostConditionReasonProgressing,
+		"Provision job triggered",
+	)
+
+	if err := r.Status().Update(ctx, hostLease); err != nil {
+		log.Error(err, "Failed to update status after triggering provision job")
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: r.ProvisionPollInterval}, nil
+}
+
+func (r *HostLeaseReconciler) pollProvisionJob(ctx context.Context, hostLease *v1alpha1.HostLease, latestJob *opv1alpha1.JobStatus, log logr.Logger) (ctrl.Result, error) {
+	status, err := r.ProvisioningProvider.GetProvisionStatus(ctx, hostLease, latestJob.JobID)
+	if err != nil {
+		log.Error(err, "Failed to get provision job status", "jobID", latestJob.JobID)
+		return ctrl.Result{RequeueAfter: r.ProvisionPollInterval}, nil
+	}
+
+	if status.State != latestJob.State || status.Message != latestJob.Message {
+		log.Info("Provision job status changed", "jobID", latestJob.JobID, "oldState", latestJob.State, "newState", status.State)
+		updatedJob := *latestJob
+		updatedJob.State = status.State
+		updatedJob.Message = status.MessageWithDetails()
+		provisioning.UpdateJob(hostLease.Status.Jobs, updatedJob)
+	}
+
+	if status.State.IsTerminal() {
+		if status.State.IsSuccessful() {
+			log.Info("Provision job succeeded", "jobID", latestJob.JobID)
+			hostLease.Status.Phase = v1alpha1.HostLeasePhaseReady
+			hostLease.SetStatusCondition(
+				v1alpha1.HostConditionProvisionTemplateComplete,
+				metav1.ConditionTrue,
+				"Succeeded",
+				"Provision job completed successfully",
+			)
+		} else {
+			log.Info("Provision job failed", "jobID", latestJob.JobID, "state", status.State)
+			hostLease.Status.Phase = v1alpha1.HostLeasePhaseFailed
+			hostLease.SetStatusCondition(
+				v1alpha1.HostConditionProvisionTemplateComplete,
+				metav1.ConditionFalse,
+				v1alpha1.HostConditionReasonTemplateFailed,
+				status.MessageWithDetails(),
+			)
+		}
+
+		if err := r.Status().Update(ctx, hostLease); err != nil {
+			log.Error(err, "Failed to update status after provision job completed")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	if err := r.Status().Update(ctx, hostLease); err != nil {
+		log.Error(err, "Failed to update status during polling")
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: r.ProvisionPollInterval}, nil
 }
 
 // syncHostLeaseStatus syncs the phase, conditions, power state and updates the HostLease status.
