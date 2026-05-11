@@ -215,6 +215,7 @@ func main() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		ironicClient,
+		os.Getenv(controller.EnvHostLeaseNamespace),
 		0, // Use DefaultRecheckInterval
 	)
 	if err := hostLeaseReconciler.SetupWithManager(mgr); err != nil {

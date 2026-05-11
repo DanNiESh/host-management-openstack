@@ -44,6 +44,9 @@ type HostLeaseReconciler struct {
 	Scheme       *runtime.Scheme
 	IronicClient ironic.NodeClient
 
+	// Namespace restricts the controller to only reconcile HostLeases in this namespace.
+	Namespace string
+
 	// RecheckInterval is the interval for polling Ironic until power state matches desired state.
 	RecheckInterval time.Duration
 }
@@ -53,8 +56,12 @@ func NewHostLeaseReconciler(
 	client client.Client,
 	scheme *runtime.Scheme,
 	ironicClient ironic.NodeClient,
+	namespace string,
 	recheckInterval time.Duration,
 ) *HostLeaseReconciler {
+	if namespace == "" {
+		namespace = defaultHostLeaseNamespace
+	}
 	if recheckInterval <= 0 {
 		recheckInterval = DefaultRecheckInterval
 	}
@@ -63,6 +70,7 @@ func NewHostLeaseReconciler(
 		Client:          client,
 		Scheme:          scheme,
 		IronicClient:    ironicClient,
+		Namespace:       namespace,
 		RecheckInterval: recheckInterval,
 	}
 }
@@ -299,10 +307,18 @@ func hostLeasePredicate() predicate.Funcs {
 	}
 }
 
+func NamespacePredicate(namespace string) predicate.Predicate {
+	return predicate.NewPredicateFuncs(
+		func(obj client.Object) bool {
+			return obj.GetNamespace() == namespace
+		},
+	)
+}
+
 func (r *HostLeaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.HostLease{},
-			builder.WithPredicates(hostLeasePredicate()),
+			builder.WithPredicates(NamespacePredicate(r.Namespace), hostLeasePredicate()),
 		).
 		Named("openstack-host").
 		Complete(r)

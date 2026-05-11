@@ -22,6 +22,10 @@ const (
 	hostClass          = "openstack"
 	hostLeaseFinalizer = "osac.openshift.io/host-management"
 
+	// EnvHostLeaseNamespace is the environment variable for the namespace to watch.
+	EnvHostLeaseNamespace     = "HOSTLEASE_NAMESPACE"
+	defaultHostLeaseNamespace = "osac-hostleases"
+
 	// DefaultRecheckInterval is the default interval for polling Ironic power state.
 	DefaultRecheckInterval = 60 * time.Second
 )
